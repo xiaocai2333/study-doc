@@ -39,7 +39,31 @@ OCC 需要对每条记录额外存储Write Timestamp。
 
 ## 5. 2PC in TiKV
 
+#### Column in TiKV
+
+TiKV 底层用 raft+rocksdb 组成的 raft-kv 作为存储引擎，具体落到 rocksdb 上的 column 有四个，除了一个用于维护 raft 集群的元数据外，其他3个都是为了保证事务的mvcc，分别是lock, write, default。
+所以在预写阶段上的锁被记录在一个抽象表里。如下：
+
+|       |          default               |                 lock                  |              write               |       raft      |  
+|:-----:|:------------------------------:|:-------------------------------------:|:--------------------------------:|:---------------:|
+|  key  | ${key}_${start_ts} => ${value} | ${key}=>${start_ts,primary_key,..etc} | ${key}_${commit_ts}=>${start_ts} |                 | 
+
 第一阶段： prewrite阶段
+    1.申请开始时间戳start_ts，发送prewrite请求
+    2.检测key是否已被上锁，以及最新的write记录的commit_ts 与当前事务的start_ts的大小，如果commit_ts >= start_ts， 则说明对应的key已经被更新，返回事务失败
+    3.如果没有检测到冲突，选一个key为primary key， 其他的都是secondary key，并发的对所有key做prewrite。
+客户端发请求之后向PD申请事务开始时间戳start_ts， 向leader发送prewrite请求，leader给各个节点发送请求，如果leader收到了所有节点的回复，则并行的对所有key执行prewrite。
+prewrite阶段会去检测是否有写写冲突，从rocksdb的write列中获取当前的key的最新数据，若commit_ts >= strat_ts，说明已经存在更新版本的提交事务，事务回滚。以及检查当前key是否已被上锁等。
+TiKV会从所有涉及到的 key 中选取一个 key 来作为 primary key，其他的key作为secondary key， 预写阶段会对所有key上锁，并且secondary key记录指向primary key。
 第二阶段： commit阶段
-客户端发请求之后向PD申请事务开始时间戳start_ts， 向leader发送prewrite请求，leader给各个节点发送请求，如果leader收到了所有节点的回复，则执行prewrite。
+    1.对于每个key依次检查其是否合法，并在内存中更新
+    2.检查key的锁，若锁存在且为当前start_ts对应的锁，则在内存中添加write(key, commit_ts, start_ts), 删除lock(key, start_ts)
+    3.如果没有检测到锁，并且记录中没有write记录，返回锁错误。如果没有检测到锁，但是检测到已经有write记录，说明已经执行过write。
+    4.在底层raft-kv中更新上面几个步骤差生的所有数据（落盘），保证原子性。
+2PC的ACID特性：
+原子性： 通过primary key 保证原子性，primary key 的commit决定整个事务是否成功commit。
+一致性：
+隔离性：RR
+持久性：TiKV保证持久化。
+commit阶段以primary key的commit为准。
 prewrite阶段完成后，再次向PD申请一个唯一的时间戳作为本次事务的commit_ts， 完成commit阶段。
