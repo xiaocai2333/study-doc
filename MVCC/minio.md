@@ -18,6 +18,7 @@ docker run -p 9000:9000 --name minio1 \
   -v /mnt/config:/root/.minio \
   minio/minio server /data
 ```
+TODO: 如何分布式部署minio。
 
 ### a. 如何连接minio？
 
